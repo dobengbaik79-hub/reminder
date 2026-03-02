@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Domain Tracker</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <style>*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}body{background:#080d18}</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+const STORAGE_KEY  = "domain_tracker_v3";
+const SESSION_KEY  = "dt_auth_token";
+const SCHED_KEY    = "dt_schedule";
+
+const getDaysLeft = (d) => {
+  const t = new Date(); t.setHours(0,0,0,0);
+  const e = new Date(d); e.setHours(0,0,0,0);
+  return Math.ceil((e - t) / 86400000);
+};
+const getStatus = (n) => n < 0 ? "expired" : n <= 7 ? "critical" : n <= 30 ? "warning" : "safe";
+const fmtDate   = (s) => new Date(s).toLocaleDateString("id-ID",{day:"2-digit",month:"short",year:"numeric"});
+const fmtTime   = (s) => { const [h,m]=s.split(":"); return (h%12||12)+":"+m+" "+(h<12?"AM":"PM"); };
+const uid       = () => Math.random().toString(36).slice(2,10);
+const jLoad     = (k,d) => { try{return JSON.parse(localStorage.getItem(k)||JSON.stringify(d));}catch{return d;} };
+const jSave     = (k,v) => localStorage.setItem(k,JSON.stringify(v));
+const lsGet     = (k)   => localStorage.getItem(k)||"";
+const lsSet     = (k,v) => localStorage.setItem(k,v);
+
+const buildMsg = (domains) => {
+  const g = (s) => domains.filter(d => getStatus(getDaysLeft(d.expiredDate))===s);
+  const [ex,cr,wa] = ["expired","critical","warning"].map(g);
+  let m = "🌐 *Domain Tracker Report*\n📅 "+new Date().toLocaleDateString("id-ID")+"\n\n";
+  const row = (d) => "• `"+d.name+"`"+(d.website?" _("+d.website+")_":"")+" — ";
+  if(ex.length){ m+="🔴 *EXPIRED ("+ex.length+")*\n"; ex.forEach(d=>m+=row(d)+"EXPIRED!\n"); m+="\n"; }
+  if(cr.length){ m+="🟠 *KRITIS ≤7 hari ("+cr.length+")*\n"; cr.forEach(d=>m+=row(d)+getDaysLeft(d.expiredDate)+" hari\n"); m+="\n"; }
+  if(wa.length){ m+="🟡 *PERHATIAN ≤30 hari ("+wa.length+")*\n"; wa.forEach(d=>m+=row(d)+getDaysLeft(d.expiredDate)+" hari\n"); m+="\n"; }
+  if(!ex.length&&!cr.length&&!wa.length) m+="✅ Semua domain aman!\n";
+  return m;
+};
+
+// ── Components ────────────────────────────────────────────────────────────────
+const Badge = ({days}) => {
+  const s=getStatus(days);
+  const map={expired:["EXPIRED","badge-expired"],critical:[days+"h","badge-critical"],warning:[days+"h","badge-warning"],safe:[days+"h","badge-safe"]};
+  return <span className={"badge "+map[s][1]}>{map[s][0]}</span>;
+};
+
+const Overlay = ({onClose,children,wide}) => (
+  <div className="overlay" onClick={onClose}>
+    <div className={"mbox"+(wide?" mbox-wide":"")} onClick={e=>e.stopPropagation()}>
+      {children}
+    </div>
+  </div>
+);
+
+const MHead = ({title,onClose}) => (
+  <div className="mhead">
+    <span>{title}</span>
+    <button className="mclose" onClick={onClose}>✕</button>
+  </div>
+);
+
+const Field = ({label,hint,children}) => (
+  <div className="field">
+    <label>{label}</label>
+    {children}
+    {hint && <p className="field-hint">{hint}</p>}
+  </div>
+);
+
+const Toggle = ({checked,onChange,label}) => (
+  <label className="toggle-wrap" onClick={()=>onChange(!checked)}>
+    <div className={"toggle"+(checked?" toggle-on":"")}>
+      <div className="toggle-knob"/>
+    </div>
+    <span className="toggle-label">{label}</span>
+  </label>
+);
+
+const EMPTY_FORM = {name:"",website:"",expiredDate:"",registrar:"",notes:""};
+const EMPTY_SCHED = {enabled:false,time:"08:00",channel:"telegram",onlyProblematic:true,lastSent:null};
+
+export default function App() {
+  const [authed,  setAuthed]  = useState(false);
+  const [authChecking, setAuthChecking] = useState(true);
+  useEffect(()=>{
+    const token = sessionStorage.getItem(SESSION_KEY);
+    if (!token){ setAuthChecking(false); return; }
+    fetch("/api/verify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token})})
+      .then(r=>r.json()).then(d=>{ if(d.ok) setAuthed(true); else sessionStorage.removeItem(SESSION_KEY); })
+      .catch(()=>{}).finally(()=>setAuthChecking(false));
+  },[]);
+  const [pw,      setPw]      = useState("");
+  const [pwErr,   setPwErr]   = useState(false);
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [domains, setDomains] = useState(()=>jLoad(STORAGE_KEY,[]));
+  const [sched,   setSched]   = useState(()=>({...EMPTY_SCHED,...jLoad(SCHED_KEY,{})}));
+  useEffect(()=>jSave(STORAGE_KEY,domains),[domains]);
+  useEffect(()=>jSave(SCHED_KEY,sched),[sched]);
+  const setS = (k,v) => setSched(p=>({...p,[k]:v}));
+
+  const [showAdd,     setShowAdd]     = useState(false);
+  const [showImport,  setShowImport]  = useState(false);
+  const [showRemind,  setShowRemind]  = useState(false);
+  const [editItem,    setEditItem]    = useState(null);
+  const [confirmDel,  setConfirmDel]  = useState(null);
+  const [confirmBulk, setConfirmBulk] = useState(false);
+  const [toast,       setToast]       = useState(null);
+  const [selected,    setSelected]    = useState(new Set());
+  const [form,        setForm]        = useState(EMPTY_FORM);
+  const setF = (k,v) => setForm(p=>({...p,[k]:v}));
+
+  const [search,        setSearch]        = useState("");
+  const [filterStatus,  setFilterStatus]  = useState("all");
+  const [filterWebsite, setFilterWebsite] = useState("all");
+  const [filterReg,     setFilterReg]     = useState("all");
+  const [sortBy,        setSortBy]        = useState("days_asc");
+
+  const [csvText,     setCsvText]     = useState("");
+  const [csvFile,     setCsvFile]     = useState(null);
+  const [importMode,  setImportMode]  = useState("file");
+  const [skipExpired, setSkipExpired] = useState(true);
+  const [dragOver,    setDragOver]    = useState(false);
+
+  const [waNum,     setWaNum]     = useState(lsGet("wa_number"));
+  const [remindTab, setRemindTab] = useState("manual");
+
+  const toast$ = useCallback((msg,type="success")=>{ setToast({msg,type}); setTimeout(()=>setToast(null),3500); },[]);
+
+  // Scheduler
+  const schedRef   = useRef(sched);
+  const domainsRef = useRef(domains);
+  useEffect(()=>{ schedRef.current=sched; },[sched]);
+  useEffect(()=>{ domainsRef.current=domains; },[domains]);
+  useEffect(()=>{
+    const tick = async () => {
+      const s = schedRef.current;
+      if (!s.enabled) return;
+      const now = new Date();
+      const [h,m] = s.time.split(":").map(Number);
+      const todayKey = now.toISOString().slice(0,10);
+      if (now.getHours()===h && now.getMinutes()===m && s.lastSent!==todayKey) {
+        const doms = domainsRef.current;
+        const hasIssue = doms.some(d=>["warning","critical","expired"].includes(getStatus(getDaysLeft(d.expiredDate))));
+        if (!s.onlyProblematic||hasIssue) {
+          if (s.channel==="telegram") {
+            try {
+              const tok = sessionStorage.getItem(SESSION_KEY);
+              await fetch("/api/send-telegram",{method:"POST",
+                headers:{"Content-Type":"application/json","Authorization":"Bearer "+tok},
+                body:JSON.stringify({message:buildMsg(doms)})});
+            } catch {}
+          } else {
+            const num = lsGet("wa_number").replace(/\D/g,"");
+            if (num) window.open("https://wa.me/"+num+"?text="+encodeURIComponent(buildMsg(doms)),"_blank");
+          }
+          setSched(p=>({...p,lastSent:todayKey}));
+          toast$("🔔 Auto reminder terkirim via "+(s.channel==="telegram"?"Telegram":"WhatsApp"));
+        }
+      }
+    };
+    const id = setInterval(tick,60000);
+    return ()=>clearInterval(id);
+  },[toast$]);
+
+  const websites   = useMemo(()=>[...new Set(domains.map(d=>d.website).filter(Boolean))].sort(),[domains]);
+  const registrars = useMemo(()=>[...new Set(domains.map(d=>d.registrar).filter(Boolean))].sort(),[domains]);
+  const stats = useMemo(()=>({
+    total:domains.length,
+    safe:    domains.filter(d=>getStatus(getDaysLeft(d.expiredDate))==="safe").length,
+    warning: domains.filter(d=>getStatus(getDaysLeft(d.expiredDate))==="warning").length,
+    critical:domains.filter(d=>getStatus(getDaysLeft(d.expiredDate))==="critical").length,
+    expired: domains.filter(d=>getStatus(getDaysLeft(d.expiredDate))==="expired").length,
+  }),[domains]);
+
+  const filtered = useMemo(()=>domains
+    .filter(d=>{
+      const q=search.toLowerCase();
+      const mq=!q||[d.name,d.website||"",d.registrar||"",d.notes||""].some(s=>s.toLowerCase().includes(q));
+      const days=getDaysLeft(d.expiredDate);
+      return mq&&(filterStatus==="all"||getStatus(days)===filterStatus)
+             &&(filterWebsite==="all"||d.website===filterWebsite)
+             &&(filterReg==="all"||d.registrar===filterReg);
+    })
+    .sort((a,b)=>{
+      const da=getDaysLeft(a.expiredDate),db=getDaysLeft(b.expiredDate);
+      if(sortBy==="days_asc") return da-db;
+      if(sortBy==="days_desc") return db-da;
+      if(sortBy==="name_asc") return a.name.localeCompare(b.name);
+      if(sortBy==="name_desc") return b.name.localeCompare(a.name);
+      return (a.website||"").localeCompare(b.website||"");
+    })
+  ,[domains,search,filterStatus,filterWebsite,filterReg,sortBy]);
+
+  const allSel = filtered.length>0 && filtered.every(d=>selected.has(d.id));
+
+  // Auth — password TIDAK dicek di frontend, dikirim ke server
+  const login = async () => {
+    setLoginLoading(true);
+    try {
+      const r = await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});
+      const d = await r.json();
+      if(d.ok){ sessionStorage.setItem(SESSION_KEY,d.token); setAuthed(true); }
+      else{ setPwErr(true); setTimeout(()=>setPwErr(false),1400); }
+    } catch { toast$("Koneksi server gagal","error"); }
+    finally { setLoginLoading(false); }
+  };
+
+  // CRUD
+  const openAdd  = () => {setEditItem(null);setForm(EMPTY_FORM);setShowAdd(true);};
+  const openEdit = (d) => {
+    setEditItem(d);
+    setForm({name:d.name,website:d.website||"",expiredDate:d.expiredDate,registrar:d.registrar||"",notes:d.notes||""});
+    setShowAdd(true);
+  };
+  const saveItem = () => {
+    if(!form.name||!form.expiredDate) return toast$("Nama domain & tanggal wajib diisi","error");
+    const key=form.name.trim().toLowerCase();
+    if(editItem){
+      const dup=domains.find(d=>d.id!==editItem.id&&d.name.toLowerCase()===key);
+      if(dup){setDomains(p=>p.filter(d=>d.id!==dup.id&&d.id!==editItem.id).concat({...dup,...form,updatedAt:new Date().toISOString()}));toast$("Duplikat ditimpa ✓");}
+      else{setDomains(p=>p.map(d=>d.id===editItem.id?{...d,...form,updatedAt:new Date().toISOString()}:d));toast$("Domain diperbarui ✓");}
+    } else {
+      const ex=domains.find(d=>d.name.toLowerCase()===key);
+      if(ex){setDomains(p=>p.map(d=>d.id===ex.id?{...d,...form,updatedAt:new Date().toISOString()}:d));toast$("Domain ditimpa ✓");}
+      else{setDomains(p=>[...p,{id:uid(),...form,addedAt:new Date().toISOString()}]);toast$("Domain ditambahkan ✓");}
+    }
+    setForm(EMPTY_FORM);setShowAdd(false);setEditItem(null);
+  };
+  const del = (id) => setConfirmDel(id);
+  const delConfirmed = () => {
+    setDomains(p=>p.filter(d=>d.id!==confirmDel));
+    setSelected(p=>{const n=new Set(p);n.delete(confirmDel);return n;});
+    setConfirmDel(null); toast$("Domain dihapus");
+  };
+  const toggleSel    = (id) => setSelected(p=>{const n=new Set(p);n.has(id)?n.delete(id):n.add(id);return n;});
+  const toggleSelAll = () => {
+    if(allSel) setSelected(p=>{const n=new Set(p);filtered.forEach(d=>n.delete(d.id));return n;});
+    else setSelected(p=>{const n=new Set(p);filtered.forEach(d=>n.add(d.id));return n;});
+  };
+  const bulkDelete = () => {
+    setDomains(p=>p.filter(d=>!selected.has(d.id)));
+    toast$(selected.size+" domain dihapus");
+    setSelected(new Set()); setConfirmBulk(false);
+  };
+
+  // Import
+  const parseLines = (raw) => {
+    const lines = raw.trim().split("\n").filter(Boolean);
+    const start = lines[0]&&!/\d{4}-\d{2}-\d{2}/.test((lines[0].split(",")[1]||"").trim())?1:0;
+    return lines.slice(start).map(line=>{
+      const cols=(line.match(/(".*?"|[^,]+)(?=,|$)/g)||line.split(",")).map(s=>s.replace(/^"|"$/g,"").trim());
+      const [name="",expiredDate="",website="",registrar="",notes=""] = cols;
+      if(!name||!expiredDate||isNaN(new Date(expiredDate))) return null;
+      return {id:uid(),name,expiredDate,website,registrar,notes,addedAt:new Date().toISOString()};
+    }).filter(Boolean);
+  };
+  const readFile = (file) => {
+    if(!file||!file.name.endsWith(".csv")) return toast$("Hanya file .csv","error");
+    const r=new FileReader();
+    r.onload=(e)=>setCsvFile({name:file.name,rows:parseLines(e.target.result)});
+    r.readAsText(file);
+  };
+  const importCSV = () => {
+    let rows=importMode==="file"?(csvFile?.rows||[]):parseLines(csvText);
+    const skippedCount = skipExpired ? rows.filter(r=>getDaysLeft(r.expiredDate)<0).length : 0;
+    if(skipExpired) rows=rows.filter(r=>getDaysLeft(r.expiredDate)>=0);
+    if(!rows.length) return toast$("Tidak ada data valid","error");
+    let added=0,updated=0;
+    setDomains(prev=>{
+      const result=[...prev];
+      rows.forEach(row=>{
+        const idx=result.findIndex(d=>d.name.toLowerCase()===row.name.toLowerCase());
+        if(idx>=0){result[idx]={...result[idx],...row,id:result[idx].id,updatedAt:new Date().toISOString()};updated++;}
+        else{result.push(row);added++;}
+      });
+      return result;
+    });
+    const parts=[added&&added+" ditambah",updated&&updated+" ditimpa",skippedCount&&skippedCount+" expired dilewati"].filter(Boolean);
+    toast$("Import: "+parts.join(", ")+" ✓");
+    setCsvFile(null);setCsvText("");setShowImport(false);
+  };
+
+  const previewRows = useMemo(()=>{
+    const rows=importMode==="file"?(csvFile?.rows||[]):parseLines(csvText);
+    return skipExpired?rows.filter(r=>getDaysLeft(r.expiredDate)>=0):rows;
+  },[importMode,csvFile,csvText,skipExpired]);
+
+  // Telegram — token ada di server, frontend hanya kirim pesan
+  const sendTg = async () => {
+    const token = sessionStorage.getItem(SESSION_KEY);
+    try {
+      const r = await fetch("/api/send-telegram",{method:"POST",
+        headers:{"Content-Type":"application/json","Authorization":"Bearer "+token},
+        body:JSON.stringify({message:buildMsg(domains)})});
+      const d = await r.json();
+      d.ok ? toast$("✅ Telegram terkirim!") : toast$(d.error||"Gagal kirim","error");
+    } catch { toast$("Koneksi server gagal","error"); }
+  };
+  const sendWA = () => {
+    if(!waNum) return toast$("Isi nomor WhatsApp di tab Kredensial","error");
+    lsSet("wa_number",waNum);
+    window.open("https://wa.me/"+waNum.replace(/\D/g,"")+"?text="+encodeURIComponent(buildMsg(domains)),"_blank");
+  };
+  const saveWA = () => { if(waNum) lsSet("wa_number",waNum); toast$("Nomor WA disimpan ✓"); };
+
+  const schedStatus = () => {
+    if(!sched.enabled) return null;
+    const ok = sched.channel==="telegram" ? true : !!lsGet("wa_number");
+    const ch = sched.channel==="telegram"?"Telegram":"WhatsApp";
+    if(!ok) return {ok:false,msg:"⚠ Reminder aktif tapi kredensial "+ch+" belum diisi"};
+    return {ok:true,msg:"✅ Auto reminder tiap "+fmtTime(sched.time)+" via "+ch+(sched.lastSent?" · terakhir "+sched.lastSent:"")};
+  };
+  const ss = schedStatus();
+
+  // ── LOGIN ──────────────────────────────────────────────────────────────────
+  if(authChecking) return (<><style>{CSS}</style><div className="login-wrap"><p style={{color:"#6a83a0",fontSize:14}}>Memverifikasi...</p></div></>);
+
+  if(!authed) return (
+    <>
+      <style>{CSS}</style>
+      <div className="login-wrap">
+        <div className="login-card">
+          <div style={{textAlign:"center",fontSize:44}}>🌐</div>
+          <h1 className="l-title">Domain<span>Tracker</span></h1>
+          <p className="l-sub">Masukkan password untuk masuk</p>
+          <div className={"l-field"+(pwErr?" shake":"")}>
+            <input type="password" placeholder="Password" value={pw}
+              onChange={e=>setPw(e.target.value)} onKeyDown={e=>e.key==="Enter"&&!loginLoading&&login()} autoFocus/>
+          </div>
+          {pwErr&&<p className="l-err">❌ Password salah!</p>}
+          <button className="btn-pri" style={{width:"100%",marginTop:8}} onClick={login} disabled={loginLoading}>
+            {loginLoading?"Memverifikasi...":"Masuk →"}
+          </button>
+        </div>
+      </div>
+    </>
+  );
+
+  // ── MAIN ──────────────────────────────────────────────────────────────────
+  return (
+    <>
+      <style>{CSS}</style>
+      <div className="app">
+
+        {/* SIDEBAR */}
+        <aside className="sidebar">
+          <div className="brand">
+            <span>🌐</span>
+            <span className="brand-name">Domain<b>Tracker</b></span>
+          </div>
+
+          {ss && <div className={"sched-pill"+(ss.ok?" pill-ok":" pill-warn")}>{ss.msg}</div>}
+
+          <p className="nlabel">STATUS</p>
+          <nav className="snav">
+            {[
+              {v:"all",   icon:"◈",lbl:"Semua"},
+              {v:"safe",  icon:"✓",lbl:"Aman",     c:"#22c55e"},
+              {v:"warning",icon:"!",lbl:"Perhatian",c:"#f59e0b"},
+              {v:"critical",icon:"!!",lbl:"Kritis", c:"#ef4444"},
+              {v:"expired",icon:"✗",lbl:"Expired",  c:"#dc2626"},
+            ].map(x=>(
+              <button key={x.v} className={"nitem"+(filterStatus===x.v?" active":"")} onClick={()=>setFilterStatus(x.v)}>
+                <span style={x.c?{color:x.c}:{}}>{x.icon}</span>
+                <span>{x.lbl}</span>
+                <span className="nbadge">{x.v==="all"?stats.total:stats[x.v]||0}</span>
+              </button>
+            ))}
+          </nav>
+
+          {websites.length>0 && <>
+            <p className="nlabel" style={{marginTop:14}}>WEBSITE</p>
+            <nav className="snav">
+              <button className={"nitem"+(filterWebsite==="all"?" active":"")} onClick={()=>setFilterWebsite("all")}>
+                <span>◈</span><span>Semua</span><span className="nbadge">{websites.length}</span>
+              </button>
+              {websites.map(w=>(
+                <button key={w} className={"nitem"+(filterWebsite===w?" active":"")} onClick={()=>setFilterWebsite(w)}>
+                  <span className="wdot">●</span>
+                  <span className="nlbl">{w}</span>
+                  <span className="nbadge">{domains.filter(d=>d.website===w).length}</span>
+                </button>
+              ))}
+            </nav>
+          </>}
+
+          {registrars.length>0 && <>
+            <p className="nlabel" style={{marginTop:14}}>REGISTRAR</p>
+            <nav className="snav">
+              <button className={"nitem"+(filterReg==="all"?" active":"")} onClick={()=>setFilterReg("all")}>
+                <span>◈</span><span>Semua</span>
+              </button>
+              {registrars.map(r=>(
+                <button key={r} className={"nitem"+(filterReg===r?" active":"")} onClick={()=>setFilterReg(r)}>
+                  <span>🏢</span><span className="nlbl">{r}</span>
+                  <span className="nbadge">{domains.filter(d=>d.registrar===r).length}</span>
+                </button>
+              ))}
+            </nav>
+          </>}
+
+          <div style={{flex:1}}/>
+          <div className="sbtns">
+            <button className="btn-pri w100" onClick={openAdd}>+ Tambah Domain</button>
+            <button className="btn-sec w100" onClick={()=>setShowImport(true)}>↑ Import CSV</button>
+            <button className="btn-remind w100" onClick={()=>setShowRemind(true)}>🔔 Reminder</button>
+            <button className="btn-logout w100" onClick={()=>{sessionStorage.removeItem(SESSION_KEY);setAuthed(false);}}>⎋ Logout</button>
+          </div>
+        </aside>
+
+        {/* MAIN */}
+        <main className="main">
+          <header className="topbar">
+            <div>
+              <h2 className="pg-title">
+                {filterWebsite!=="all"?"📁 "+filterWebsite:filterReg!=="all"?"🏢 "+filterReg:
+                 filterStatus==="all"?"Semua Domain":filterStatus==="safe"?"Domain Aman":
+                 filterStatus==="warning"?"Hampir Expired":filterStatus==="critical"?"Kritis":"Expired"}
+              </h2>
+              <p className="pg-sub">{filtered.length} dari {domains.length} domain</p>
+            </div>
+            <div className="tb-right">
+              <input className="search" placeholder="Cari domain, website, registrar..."
+                value={search} onChange={e=>setSearch(e.target.value)}/>
+              <select className="sel" value={sortBy} onChange={e=>setSortBy(e.target.value)}>
+                <option value="days_asc">Terdekat expired</option>
+                <option value="days_desc">Terjauh expired</option>
+                <option value="name_asc">Nama A–Z</option>
+                <option value="name_desc">Nama Z–A</option>
+                <option value="web_asc">Website A–Z</option>
+              </select>
+            </div>
+          </header>
+
+          {(filterWebsite!=="all"||filterReg!=="all"||filterStatus!=="all"||search)&&(
+            <div className="chips">
+              {filterStatus!=="all"&&<span className="chip">Status: {filterStatus}<button onClick={()=>setFilterStatus("all")}>×</button></span>}
+              {filterWebsite!=="all"&&<span className="chip">Website: {filterWebsite}<button onClick={()=>setFilterWebsite("all")}>×</button></span>}
+              {filterReg!=="all"&&<span className="chip">Registrar: {filterReg}<button onClick={()=>setFilterReg("all")}>×</button></span>}
+              {search&&<span className="chip">"{search}"<button onClick={()=>setSearch("")}>×</button></span>}
+              <button className="chip-clear" onClick={()=>{setFilterStatus("all");setFilterWebsite("all");setFilterReg("all");setSearch("");}}>Hapus semua</button>
+            </div>
+          )}
+
+          <div className="stats">
+            {[{lbl:"Total",v:stats.total,c:"#2186f0"},{lbl:"Aman",v:stats.safe,c:"#22c55e"},{lbl:"Perhatian",v:stats.warning,c:"#f59e0b"},{lbl:"Kritis",v:stats.critical,c:"#ef4444"},{lbl:"Expired",v:stats.expired,c:"#dc2626"}].map(s=>(
+              <div key={s.lbl} className="scard" style={{borderTopColor:s.c}}>
+                <div className="sval" style={{color:s.c}}>{s.v}</div>
+                <div className="slbl">{s.lbl}</div>
+              </div>
+            ))}
+          </div>
+
+          {selected.size>0&&(
+            <div className="bulk-bar">
+              <span className="bulk-count">✔ {selected.size} dipilih</span>
+              <button className="bulk-del-btn" onClick={()=>setConfirmBulk(true)}>🗑 Hapus {selected.size} Domain</button>
+              <button className="bulk-clr-btn" onClick={()=>setSelected(new Set())}>Batalkan</button>
+            </div>
+          )}
+
+          <div className="twrap">
+            {filtered.length===0?(
+              <div className="empty">
+                <div style={{fontSize:48,opacity:.3}}>🌐</div>
+                <p>Tidak ada domain ditemukan.</p>
+                {domains.length===0&&<button className="btn-pri" style={{marginTop:16,padding:"10px 24px"}} onClick={openAdd}>+ Tambah Domain Pertama</button>}
+              </div>
+            ):(
+              <table className="tbl">
+                <thead>
+                  <tr>
+                    <th style={{width:36}}><input type="checkbox" className="cb" checked={allSel} onChange={toggleSelAll}/></th>
+                    <th>Domain</th><th>Website</th><th>Registrar</th><th>Tgl Expired</th><th>Sisa</th><th>Status</th><th>Aksi</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map(d=>{
+                    const days=getDaysLeft(d.expiredDate), st=getStatus(days), isSel=selected.has(d.id);
+                    return (
+                      <tr key={d.id} className={"tr-"+st+(isSel?" tr-sel":"")}>
+                        <td><input type="checkbox" className="cb" checked={isSel} onChange={()=>toggleSel(d.id)}/></td>
+                        <td>
+                          <div className="d-name">{d.name}</div>
+                          {d.notes&&<div className="d-notes">{d.notes}</div>}
+                        </td>
+                        <td>{d.website?<span className="web-tag" onClick={()=>setFilterWebsite(d.website)}>{d.website}</span>:<span className="muted">—</span>}</td>
+                        <td>{d.registrar?<span className="reg-tag" onClick={()=>setFilterReg(d.registrar)}>{d.registrar}</span>:<span className="muted">—</span>}</td>
+                        <td className="td-mono">{fmtDate(d.expiredDate)}</td>
+                        <td><span className={"dpill dp-"+st}>{days<0?Math.abs(days)+"h lalu":days+" hari"}</span></td>
+                        <td><Badge days={days}/></td>
+                        <td><div className="acts">
+                          <button className="act-edit" onClick={()=>openEdit(d)}>✏</button>
+                          <button className="act-del"  onClick={()=>del(d.id)}>🗑</button>
+                        </div></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </main>
+
+        {toast&&<div className={"toast t-"+toast.type}>{toast.msg}</div>}
+
+        {/* MODAL ADD/EDIT */}
+        {showAdd&&(
+          <Overlay onClose={()=>{setShowAdd(false);setEditItem(null);}}>
+            <MHead title={editItem?"✏ Edit Domain":"+ Tambah Domain"} onClose={()=>{setShowAdd(false);setEditItem(null);}}/>
+            <div className="mform">
+              <Field label="Nama Domain *"><input placeholder="contoh.com" value={form.name} onChange={e=>setF("name",e.target.value)}/></Field>
+              <Field label="Nama Website"><input placeholder="Toko Online, Blog, Portal..." value={form.website} onChange={e=>setF("website",e.target.value)} list="wl"/><datalist id="wl">{websites.map(w=><option key={w} value={w}/>)}</datalist></Field>
+              <Field label="Tanggal Expired *"><input type="date" value={form.expiredDate} onChange={e=>setF("expiredDate",e.target.value)}/></Field>
+              <Field label="Registrar"><input placeholder="Namecheap, GoDaddy, Domainesia..." value={form.registrar} onChange={e=>setF("registrar",e.target.value)} list="rl"/><datalist id="rl">{registrars.map(r=><option key={r} value={r}/>)}</datalist></Field>
+              <Field label="Catatan"><input placeholder="Opsional..." value={form.notes} onChange={e=>setF("notes",e.target.value)}/></Field>
+              <div className="mf-actions">
+                <button className="btn-pri" style={{flex:1}} onClick={saveItem}>{editItem?"Simpan":"Tambah Domain"}</button>
+                <button className="btn-sec" style={{flex:1}} onClick={()=>{setShowAdd(false);setEditItem(null);}}>Batal</button>
+              </div>
+            </div>
+          </Overlay>
+        )}
+
+        {/* MODAL IMPORT */}
+        {showImport&&(
+          <Overlay wide onClose={()=>{setShowImport(false);setCsvFile(null);setCsvText("");}}>
+            <MHead title="↑ Import CSV" onClose={()=>{setShowImport(false);setCsvFile(null);setCsvText("");}}/>
+            <div className="mform">
+              <div className="csv-info">
+                <div className="csv-info-title">📋 Format Kolom</div>
+                <pre className="csv-eg">nama_domain, tanggal_expired, nama_website, registrar, catatan</pre>
+                <p className="hint" style={{marginTop:4}}>Tanggal: <code>YYYY-MM-DD</code> · Header baris pertama otomatis dilewati · Kolom 3–5 opsional</p>
+              </div>
+              <div className="skip-row">
+                <Toggle checked={skipExpired} onChange={setSkipExpired} label="Lewati domain yang sudah expired saat import"/>
+              </div>
+              <div className="import-tabs">
+                <button className={"itab"+(importMode==="file"?" itab-active":"")} onClick={()=>{setImportMode("file");setCsvText("");}}>📁 Upload File</button>
+                <button className={"itab"+(importMode==="paste"?" itab-active":"")} onClick={()=>{setImportMode("paste");setCsvFile(null);}}>📋 Paste Teks</button>
+              </div>
+              {importMode==="file"&&(
+                <div className={"dropzone"+(dragOver?" dropzone-over":"")+(csvFile?" dropzone-done":"")}
+                  onDragOver={e=>{e.preventDefault();setDragOver(true);}}
+                  onDragLeave={()=>setDragOver(false)}
+                  onDrop={e=>{e.preventDefault();setDragOver(false);readFile(e.dataTransfer.files[0]);}}
+                  onClick={()=>document.getElementById("cfi").click()}>
+                  <input id="cfi" type="file" accept=".csv" style={{display:"none"}} onChange={e=>readFile(e.target.files[0])}/>
+                  {csvFile?(
+                    <div className="dz-done">
+                      <span style={{fontSize:28}}>✅</span>
+                      <div><div className="dz-fname">{csvFile.name}</div><div className="dz-count">{csvFile.rows.length} baris ditemukan</div></div>
+                      <button className="dz-clear" onClick={e=>{e.stopPropagation();setCsvFile(null);}}>✕</button>
+                    </div>
+                  ):(
+                    <div className="dz-idle">
+                      <span style={{fontSize:36}}>📂</span>
+                      <div className="dz-text">Drag &amp; drop file <b>.csv</b></div>
+                      <div className="dz-sub">atau klik untuk pilih file</div>
+                    </div>
+                  )}
+                </div>
+              )}
+              {importMode==="paste"&&(
+                <Field label="Paste data CSV">
+                  <textarea rows={7} placeholder={"contoh.com, 2025-12-31, Toko Online, Namecheap\nmyblog.id, 2026-03-15, Blog"} value={csvText} onChange={e=>setCsvText(e.target.value)}/>
+                </Field>
+              )}
+              {previewRows.length>0&&(
+                <div className="preview-wrap">
+                  <p className="preview-title">Preview — {previewRows.length} domain{skipExpired?" (expired dilewati)":""}</p>
+                  <div className="preview-scroll">
+                    <table className="preview-tbl">
+                      <thead><tr><th>#</th><th>Domain</th><th>Website</th><th>Registrar</th><th>Expired</th></tr></thead>
+                      <tbody>
+                        {previewRows.slice(0,10).map((r,i)=>(
+                          <tr key={i}>
+                            <td className="muted">{i+1}</td>
+                            <td style={{fontWeight:700,fontFamily:"var(--mono)",fontSize:12}}>{r.name}</td>
+                            <td className="muted" style={{fontSize:12}}>{r.website||"—"}</td>
+                            <td className="muted" style={{fontSize:12}}>{r.registrar||"—"}</td>
+                            <td style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--txt2)"}}>{fmtDate(r.expiredDate)}</td>
+                          </tr>
+                        ))}
+                        {previewRows.length>10&&<tr><td colSpan={5} style={{textAlign:"center",color:"var(--txt3)",fontSize:12,padding:8}}>...dan {previewRows.length-10} lainnya</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+              <div className="mf-actions">
+                <button className="btn-pri" style={{flex:1}} onClick={importCSV}>↑ Import {previewRows.length?"("+previewRows.length+" domain)":"Sekarang"}</button>
+                <button className="btn-sec" style={{flex:1}} onClick={()=>{setShowImport(false);setCsvFile(null);setCsvText("");}}>Batal</button>
+              </div>
+            </div>
+          </Overlay>
+        )}
+
+        {/* MODAL REMINDER */}
+        {showRemind&&(
+          <Overlay wide onClose={()=>setShowRemind(false)}>
+            <MHead title="🔔 Reminder" onClose={()=>setShowRemind(false)}/>
+            <div className="mform">
+              <div className="remind-tabs">
+                <button className={"rtab"+(remindTab==="manual"?" rtab-active":"")} onClick={()=>setRemindTab("manual")}>📤 Kirim Manual</button>
+                <button className={"rtab"+(remindTab==="auto"?" rtab-active":"")}   onClick={()=>setRemindTab("auto")}>⏰ Auto Harian</button>
+                <button className={"rtab"+(remindTab==="creds"?" rtab-active":"")} onClick={()=>setRemindTab("creds")}>🔑 Kredensial</button>
+              </div>
+
+              {remindTab==="manual"&&(
+                <div className="remind-grid">
+                  <div className="rsect">
+                    <h3>🤖 Telegram</h3>
+                    <p className="hint">Kirim laporan domain sekarang ke Telegram bot kamu.</p>
+                    <button className="btn-pri w100" onClick={sendTg}>📤 Kirim ke Telegram</button>
+                  </div>
+                  <div className="rdivider"/>
+                  <div className="rsect">
+                    <h3>💬 WhatsApp</h3>
+                    <p className="hint">Buka WhatsApp dengan pesan laporan domain.</p>
+                    <button className="btn-wa w100" onClick={sendWA}>📲 Buka WhatsApp</button>
+                  </div>
+                </div>
+              )}
+
+              {remindTab==="auto"&&(
+                <div style={{display:"flex",flexDirection:"column",gap:14}}>
+                  <Toggle checked={sched.enabled} onChange={v=>setS("enabled",v)} label="Aktifkan auto reminder harian"/>
+                  {ss&&<div className={"auto-status"+(ss.ok?" auto-ok":" auto-warn")}>{ss.msg}</div>}
+                  <div className={"auto-body"+(!sched.enabled?" auto-disabled":"")}>
+                    <Field label="Jam Pengiriman">
+                      <input type="time" value={sched.time} disabled={!sched.enabled} onChange={e=>setS("time",e.target.value)}/>
+                    </Field>
+                    <Field label="Kirim Via">
+                      <div className="ch-select">
+                        <button disabled={!sched.enabled} className={"ch-btn"+(sched.channel==="telegram"?" ch-active":"")} onClick={()=>setS("channel","telegram")}>🤖 Telegram</button>
+                        <button disabled={!sched.enabled} className={"ch-btn"+(sched.channel==="whatsapp"?" ch-active":"")} onClick={()=>setS("channel","whatsapp")}>💬 WhatsApp</button>
+                      </div>
+                    </Field>
+                    <div className="skip-row">
+                      <Toggle checked={sched.onlyProblematic} onChange={v=>setS("onlyProblematic",v)} label="Hanya kirim jika ada domain warning/kritis/expired"/>
+                    </div>
+                    <div className="auto-note">
+                      ⚠ Halaman harus terbuka di browser agar scheduler berjalan. Scheduler dicek tiap menit.
+                      {sched.lastSent&&<span> · Terakhir: <b>{sched.lastSent}</b></span>}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {remindTab==="creds"&&(
+                <div style={{display:"flex",flexDirection:"column",gap:14}}>
+                  {/* TELEGRAM */}
+                                 {/* WHATSAPP */}
+                  <div className="cred-block">
+                    <div className="cred-block-title">💬 WhatsApp</div>
+                    <Field label="Nomor WhatsApp" hint="Sertakan kode negara, tanpa + atau spasi. Indonesia: awali 62. Contoh: 6281234567890">
+                      <input placeholder="6281234567890" value={waNum} onChange={e=>setWaNum(e.target.value)}/>
+                    </Field>
+                  </div>
+                  <button className="btn-pri w100" onClick={saveCreds}>💾 Simpan Kredensial</button>
+                </div>
+              )}
+            </div>
+          </Overlay>
+        )}
+
+        {/* KONFIRMASI HAPUS SINGLE */}
+        {confirmDel&&(
+          <Overlay onClose={()=>setConfirmDel(null)}>
+            <MHead title="⚠️ Konfirmasi Hapus" onClose={()=>setConfirmDel(null)}/>
+            <div className="mform">
+              <p className="conf-msg">Yakin hapus <b>{domains.find(d=>d.id===confirmDel)?.name}</b>?</p>
+              <div className="mf-actions">
+                <button className="btn-danger" style={{flex:1}} onClick={delConfirmed}>🗑 Ya, Hapus</button>
+                <button className="btn-sec"    style={{flex:1}} onClick={()=>setConfirmDel(null)}>Batal</button>
+              </div>
+            </div>
+          </Overlay>
+        )}
+
+        {/* KONFIRMASI BULK HAPUS */}
+        {confirmBulk&&(
+          <Overlay onClose={()=>setConfirmBulk(false)}>
+            <MHead title={"⚠️ Hapus "+selected.size+" Domain"} onClose={()=>setConfirmBulk(false)}/>
+            <div className="mform">
+              <p className="conf-msg">Menghapus <b>{selected.size} domain</b> sekaligus. Tidak bisa dibatalkan.</p>
+              <div className="bulk-preview">
+                {[...selected].slice(0,5).map(id=>{const d=domains.find(x=>x.id===id);return d?<div key={id} className="bulk-item">🗑 {d.name}</div>:null;})}
+                {selected.size>5&&<div className="bulk-item" style={{color:"var(--txt3)"}}>...dan {selected.size-5} lainnya</div>}
+              </div>
+              <div className="mf-actions">
+                <button className="btn-danger" style={{flex:1}} onClick={bulkDelete}>🗑 Hapus Semua</button>
+                <button className="btn-sec"    style={{flex:1}} onClick={()=>setConfirmBulk(false)}>Batal</button>
+              </div>
+            </div>
+          </Overlay>
+        )}
+
+      </div>
+    </>
+  );
+}
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#080d18;--bg2:#0d1424;--bg3:#121b2e;
+  --bdr:#1a2840;--bdr2:#223050;
+  --txt:#dce8f5;--txt2:#6a83a0;--txt3:#3a5070;
+  --acc:#1464c8;--acc2:#1a78ea;
+  --font:'Syne',sans-serif;--mono:'DM Mono',monospace;
+}
+body{background:var(--bg);color:var(--txt);font-family:var(--font);}
+.login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;
+  background:radial-gradient(ellipse 80% 60% at 50% 0%,#0a2550,var(--bg) 70%);}
+.login-card{background:var(--bg2);border:1px solid var(--bdr2);border-radius:20px;padding:48px 40px;
+  width:380px;display:flex;flex-direction:column;gap:14px;box-shadow:0 40px 100px rgba(0,0,0,.7);}
+.l-title{text-align:center;font-size:26px;font-weight:800;letter-spacing:-.5px;}
+.l-title span{color:var(--acc2);}
+.l-sub{text-align:center;color:var(--txt2);font-size:13px;}
+.l-field input{width:100%;padding:12px 16px;background:var(--bg3);border:1px solid var(--bdr2);
+  border-radius:10px;color:var(--txt);font-family:var(--font);font-size:15px;outline:none;transition:border .2s;}
+.l-field input:focus{border-color:var(--acc2);}
+.l-err{color:#ef4444;font-size:13px;text-align:center;}
+.l-hint{text-align:center;color:var(--txt3);font-size:12px;}
+.l-hint code{background:var(--bg3);padding:2px 6px;border-radius:4px;font-family:var(--mono);color:var(--txt2);}
+@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}
+.shake{animation:shake .3s ease;}
+.app{display:flex;height:100vh;overflow:hidden;}
+.sidebar{width:254px;min-width:254px;background:var(--bg2);border-right:1px solid var(--bdr);
+  display:flex;flex-direction:column;padding:18px 12px;gap:4px;overflow-y:auto;}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 8px 16px;border-bottom:1px solid var(--bdr);margin-bottom:6px;}
+.brand span:first-child{font-size:20px;}
+.brand-name{font-size:15px;font-weight:600;color:var(--txt2);}
+.brand-name b{color:var(--txt);}
+.sched-pill{font-size:11px;padding:7px 10px;border-radius:8px;margin-bottom:4px;line-height:1.5;}
+.pill-ok{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.2);color:#4ade80;}
+.pill-warn{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.2);color:#fbbf24;}
+.nlabel{font-size:10px;font-weight:700;letter-spacing:1.2px;color:var(--txt3);padding:4px 8px;text-transform:uppercase;}
+.snav{display:flex;flex-direction:column;gap:2px;}
+.nitem{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:7px;
+  background:none;border:none;color:var(--txt2);font-family:var(--font);font-size:13px;
+  cursor:pointer;transition:all .15s;text-align:left;width:100%;min-width:0;}
+.nitem:hover{background:var(--bg3);color:var(--txt);}
+.nitem.active{background:var(--acc);color:#fff;}
+.nlbl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;}
+.nbadge{margin-left:auto;background:rgba(255,255,255,.1);padding:1px 7px;border-radius:20px;font-size:11px;font-family:var(--mono);flex-shrink:0;}
+.nitem.active .nbadge{background:rgba(255,255,255,.25);}
+.wdot{font-size:8px;color:var(--acc2);}
+.sbtns{display:flex;flex-direction:column;gap:6px;padding-top:12px;border-top:1px solid var(--bdr);}
+.btn-pri{background:var(--acc);color:#fff;border:none;padding:10px 16px;border-radius:8px;cursor:pointer;font-family:var(--font);font-size:13px;font-weight:700;transition:background .15s;}
+.btn-pri:hover{background:var(--acc2);}
+.btn-sec{background:var(--bg3);color:var(--txt2);border:1px solid var(--bdr2);padding:10px 16px;border-radius:8px;cursor:pointer;font-family:var(--font);font-size:13px;transition:all .15s;}
+.btn-sec:hover{color:var(--txt);border-color:var(--acc);}
+.btn-remind{background:linear-gradient(135deg,#142d55,#0d1e3a);border:1px solid #1e3f6a;color:#6baee8;padding:10px 16px;border-radius:8px;cursor:pointer;font-family:var(--font);font-size:13px;font-weight:700;transition:all .15s;}
+.btn-remind:hover{border-color:#3a7cc4;color:#93c8f4;}
+.btn-wa{background:#128C7E;color:#fff;border:none;padding:10px 16px;border-radius:8px;cursor:pointer;font-family:var(--font);font-size:13px;font-weight:700;}
+.btn-wa:hover{background:#075E54;}
+.btn-logout{background:none;border:1px solid var(--bdr2);color:var(--txt3);padding:8px;border-radius:8px;cursor:pointer;font-family:var(--font);font-size:12px;transition:all .15s;}
+.btn-logout:hover{border-color:#dc2626;color:#dc2626;}
+.btn-danger{background:#dc2626;color:#fff;border:none;padding:10px 16px;border-radius:8px;cursor:pointer;font-family:var(--font);font-size:13px;font-weight:700;transition:background .15s;}
+.btn-danger:hover{background:#b91c1c;}
+.w100{width:100%;}
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:16px 22px;border-bottom:1px solid var(--bdr);gap:16px;flex-shrink:0;}
+.pg-title{font-size:18px;font-weight:800;letter-spacing:-.3px;}
+.pg-sub{color:var(--txt2);font-size:12px;margin-top:2px;}
+.tb-right{display:flex;gap:8px;align-items:center;}
+.search{background:var(--bg3);border:1px solid var(--bdr2);color:var(--txt);padding:8px 14px;border-radius:8px;font-family:var(--font);font-size:13px;outline:none;width:250px;transition:border .2s;}
+.search:focus{border-color:var(--acc2);}
+.sel{background:var(--bg3);border:1px solid var(--bdr2);color:var(--txt2);padding:8px 12px;border-radius:8px;font-family:var(--font);font-size:12px;outline:none;cursor:pointer;}
+.chips{display:flex;flex-wrap:wrap;gap:6px;padding:9px 22px;border-bottom:1px solid var(--bdr);flex-shrink:0;}
+.chip{background:rgba(26,120,234,.15);border:1px solid rgba(26,120,234,.3);color:#6baee8;padding:3px 10px;border-radius:20px;font-size:12px;display:flex;align-items:center;gap:5px;}
+.chip button{background:none;border:none;color:inherit;cursor:pointer;font-size:14px;line-height:1;}
+.chip-clear{background:none;border:1px solid var(--bdr2);color:var(--txt3);padding:3px 10px;border-radius:20px;font-size:12px;cursor:pointer;}
+.chip-clear:hover{color:#ef4444;border-color:#ef4444;}
+.stats{display:flex;gap:10px;padding:12px 22px;border-bottom:1px solid var(--bdr);flex-shrink:0;}
+.scard{flex:1;background:var(--bg2);border:1px solid var(--bdr);border-top:3px solid;border-radius:10px;padding:10px 14px;text-align:center;}
+.sval{font-size:22px;font-weight:800;font-family:var(--mono);}
+.slbl{font-size:11px;color:var(--txt2);margin-top:2px;}
+.bulk-bar{display:flex;align-items:center;gap:10px;padding:9px 22px;background:rgba(26,100,200,.12);border-bottom:2px solid var(--acc);flex-shrink:0;}
+.bulk-count{font-size:13px;font-weight:700;color:#6baee8;}
+.bulk-del-btn{background:rgba(220,38,38,.2);border:1px solid rgba(220,38,38,.4);color:#f87171;padding:5px 14px;border-radius:7px;cursor:pointer;font-family:var(--font);font-size:12px;font-weight:700;transition:all .15s;}
+.bulk-del-btn:hover{background:rgba(220,38,38,.35);}
+.bulk-clr-btn{background:none;border:1px solid var(--bdr2);color:var(--txt3);padding:5px 14px;border-radius:7px;cursor:pointer;font-family:var(--font);font-size:12px;margin-left:auto;}
+.cb{width:15px;height:15px;cursor:pointer;accent-color:var(--acc2);}
+.twrap{flex:1;overflow-y:auto;padding:14px 22px;}
+.tbl{width:100%;border-collapse:collapse;font-size:13.5px;}
+.tbl th{text-align:left;padding:9px 12px;color:var(--txt3);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.6px;border-bottom:1px solid var(--bdr);position:sticky;top:0;background:var(--bg);z-index:2;}
+.tbl td{padding:10px 12px;border-bottom:1px solid var(--bdr);vertical-align:middle;}
+.tbl tbody tr:hover td{background:var(--bg2);}
+.tr-sel td{background:rgba(26,100,200,.08)!important;}
+.tr-expired td{opacity:.65;}
+.d-name{font-weight:700;font-family:var(--mono);font-size:13px;}
+.d-notes{color:var(--txt3);font-size:11px;margin-top:3px;}
+.muted{color:var(--txt2);}
+.td-mono{color:var(--txt2);font-family:var(--mono);font-size:12.5px;}
+.web-tag{background:rgba(26,120,234,.15);border:1px solid rgba(26,120,234,.25);color:#5aa0e0;padding:2px 9px;border-radius:6px;font-size:12px;font-weight:600;white-space:nowrap;display:inline-block;cursor:pointer;transition:all .15s;}
+.web-tag:hover{background:rgba(26,120,234,.3);}
+.reg-tag{background:rgba(100,180,100,.1);border:1px solid rgba(100,180,100,.2);color:#7bc87b;padding:2px 9px;border-radius:6px;font-size:12px;font-weight:600;white-space:nowrap;display:inline-block;cursor:pointer;transition:all .15s;}
+.reg-tag:hover{background:rgba(100,180,100,.2);}
+.dpill{display:inline-block;padding:3px 10px;border-radius:20px;font-family:var(--mono);font-size:12px;font-weight:500;}
+.dp-safe{background:rgba(34,197,94,.12);color:#4ade80;}
+.dp-warning{background:rgba(245,158,11,.12);color:#fbbf24;}
+.dp-critical{background:rgba(239,68,68,.12);color:#f87171;}
+.dp-expired{background:rgba(220,38,38,.12);color:#ef4444;}
+.badge{padding:2px 8px;border-radius:4px;font-size:10.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;font-family:var(--mono);}
+.badge-safe{background:rgba(34,197,94,.18);color:#4ade80;border:1px solid rgba(34,197,94,.25);}
+.badge-warning{background:rgba(245,158,11,.18);color:#fbbf24;border:1px solid rgba(245,158,11,.25);}
+.badge-critical{background:rgba(239,68,68,.18);color:#f87171;border:1px solid rgba(239,68,68,.25);}
+.badge-expired{background:rgba(220,38,38,.18);color:#ef4444;border:1px solid rgba(220,38,38,.25);}
+.acts{display:flex;gap:5px;}
+.act-edit,.act-del{background:var(--bg3);border:1px solid var(--bdr2);color:var(--txt2);padding:4px 8px;border-radius:6px;cursor:pointer;font-size:12px;transition:all .15s;}
+.act-edit:hover{color:var(--acc2);border-color:var(--acc);}
+.act-del:hover{color:#ef4444;border-color:#ef4444;}
+.empty{text-align:center;padding:80px 20px;color:var(--txt2);display:flex;flex-direction:column;align-items:center;gap:12px;}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.78);backdrop-filter:blur(5px);display:flex;align-items:center;justify-content:center;z-index:100;}
+.mbox{background:var(--bg2);border:1px solid var(--bdr2);border-radius:16px;width:460px;max-width:95vw;max-height:92vh;overflow-y:auto;animation:fadeUp .2s ease;}
+.mbox-wide{width:700px;}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}}
+.mhead{display:flex;align-items:center;justify-content:space-between;padding:16px 22px;border-bottom:1px solid var(--bdr);font-weight:700;font-size:14px;}
+.mclose{background:none;border:none;color:var(--txt2);cursor:pointer;font-size:18px;}
+.mclose:hover{color:var(--txt);}
+.mform{padding:18px 22px;display:flex;flex-direction:column;gap:12px;}
+.field{display:flex;flex-direction:column;gap:5px;}
+.field label{font-size:11px;font-weight:700;color:var(--txt2);text-transform:uppercase;letter-spacing:.6px;}
+.field input,.field textarea{background:var(--bg3);border:1px solid var(--bdr2);color:var(--txt);padding:9px 13px;border-radius:8px;font-family:var(--font);font-size:13.5px;outline:none;transition:border .2s;resize:vertical;width:100%;}
+.field input:focus,.field textarea:focus{border-color:var(--acc2);}
+.field input:disabled{opacity:.4;cursor:not-allowed;}
+.field-hint{font-size:11px;color:var(--txt3);line-height:1.5;margin-top:2px;}
+.mf-actions{display:flex;gap:8px;margin-top:4px;}
+.hint{font-size:12px;color:var(--txt3);line-height:1.7;}
+.hint code{background:var(--bg);padding:1px 5px;border-radius:3px;font-family:var(--mono);color:var(--acc2);font-size:11px;}
+.conf-msg{font-size:14px;color:var(--txt2);line-height:1.6;}
+.conf-msg b{color:var(--txt);}
+.bulk-preview{background:var(--bg3);border:1px solid var(--bdr);border-radius:8px;padding:10px 14px;display:flex;flex-direction:column;gap:6px;max-height:150px;overflow-y:auto;}
+.bulk-item{font-size:13px;color:var(--txt2);font-family:var(--mono);}
+.toggle-wrap{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none;}
+.toggle{width:40px;height:22px;border-radius:11px;background:var(--bg3);border:1px solid var(--bdr2);position:relative;cursor:pointer;transition:all .2s;flex-shrink:0;}
+.toggle-on{background:var(--acc);border-color:var(--acc);}
+.toggle-knob{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .2s;box-shadow:0 1px 3px rgba(0,0,0,.3);}
+.toggle-on .toggle-knob{transform:translateX(18px);}
+.toggle-label{font-size:13px;color:var(--txt2);}
+.skip-row{background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.2);padding:10px 14px;border-radius:8px;}
+.remind-tabs{display:flex;gap:6px;}
+.rtab{flex:1;padding:9px;border-radius:8px;background:var(--bg3);border:1px solid var(--bdr2);color:var(--txt2);font-family:var(--font);font-size:12.5px;font-weight:600;cursor:pointer;transition:all .15s;}
+.rtab:hover{color:var(--txt);border-color:var(--acc);}
+.rtab-active{background:rgba(20,100,200,.2);border-color:var(--acc);color:#6baee8;}
+.remind-grid{display:grid;grid-template-columns:1fr 1px 1fr;gap:0;}
+.rsect{display:flex;flex-direction:column;gap:10px;padding:4px 10px;}
+.rsect h3{font-size:14px;font-weight:700;}
+.rdivider{background:var(--bdr);margin:0 8px;}
+.auto-status{font-size:11px;padding:8px 10px;border-radius:7px;line-height:1.5;}
+.auto-ok{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);color:#4ade80;}
+.auto-warn{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.25);color:#fbbf24;}
+.auto-body{display:flex;flex-direction:column;gap:12px;transition:opacity .2s;}
+.auto-disabled{opacity:.4;pointer-events:none;}
+.ch-select{display:flex;gap:8px;}
+.ch-btn{flex:1;padding:9px;border-radius:8px;background:var(--bg3);border:1px solid var(--bdr2);color:var(--txt2);font-family:var(--font);font-size:13px;cursor:pointer;transition:all .15s;}
+.ch-btn:hover:not(:disabled){color:var(--txt);border-color:var(--acc);}
+.ch-active{background:rgba(20,100,200,.2);border-color:var(--acc);color:#6baee8;}
+.ch-btn:disabled{cursor:not-allowed;}
+.auto-note{background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.2);border-radius:8px;padding:11px 13px;font-size:12px;color:#d4a24a;line-height:1.6;}
+.cred-block{display:flex;flex-direction:column;gap:10px;}
+.cred-block-title{font-size:13px;font-weight:700;color:var(--txt);}
+.cred-divider{border:none;border-top:1px solid var(--bdr);}
+.guide-box{background:var(--bg3);border:1px solid var(--bdr2);border-radius:10px;padding:13px 14px;display:flex;flex-direction:column;gap:8px;}
+.guide-title{font-size:11px;font-weight:700;color:var(--txt2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px;}
+.guide-step{display:flex;gap:10px;align-items:flex-start;font-size:12px;color:var(--txt2);line-height:1.55;background:rgba(255,255,255,.03);border:1px solid var(--bdr);border-radius:7px;padding:8px 10px;}
+.guide-step b{color:var(--txt);}
+.guide-step code{background:var(--bg);padding:1px 5px;border-radius:3px;font-family:var(--mono);color:var(--acc2);font-size:11px;}
+.guide-alert{background:rgba(239,68,68,.07);border-color:rgba(239,68,68,.2);color:#fca5a5;}
+.step-n{background:var(--acc);color:#fff;font-size:11px;font-weight:800;min-width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px;}
+.guide-btn{background:none;border:1px solid var(--bdr2);color:var(--txt2);padding:7px 14px;border-radius:7px;cursor:pointer;font-family:var(--font);font-size:12px;font-weight:600;align-self:flex-start;transition:all .15s;}
+.guide-btn:hover{color:var(--acc2);border-color:var(--acc);}
+.csv-info{background:var(--bg3);border:1px solid var(--bdr);border-radius:10px;padding:12px 14px;}
+.csv-info-title{font-size:12px;font-weight:700;color:var(--txt2);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:4px;}
+.csv-eg{background:var(--bg);border:1px solid var(--bdr);padding:9px 12px;border-radius:6px;font-family:var(--mono);font-size:11.5px;color:var(--txt2);line-height:1.7;white-space:pre-wrap;}
+.import-tabs{display:flex;gap:6px;}
+.itab{flex:1;padding:9px;border-radius:8px;background:var(--bg3);border:1px solid var(--bdr2);color:var(--txt2);font-family:var(--font);font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;}
+.itab:hover{color:var(--txt);border-color:var(--acc);}
+.itab-active{background:rgba(20,100,200,.2);border-color:var(--acc);color:#6baee8;}
+.dropzone{border:2px dashed var(--bdr2);border-radius:12px;padding:30px 20px;text-align:center;cursor:pointer;transition:all .2s;background:var(--bg3);}
+.dropzone:hover,.dropzone-over{border-color:var(--acc2);background:rgba(20,100,200,.08);}
+.dropzone-done{border-style:solid;border-color:#22c55e;background:rgba(34,197,94,.06);}
+.dz-idle{display:flex;flex-direction:column;align-items:center;gap:8px;}
+.dz-text{font-size:14px;font-weight:600;color:var(--txt2);}
+.dz-sub{font-size:12px;color:var(--txt3);}
+.dz-done{display:flex;align-items:center;gap:14px;text-align:left;}
+.dz-fname{font-weight:700;font-family:var(--mono);font-size:13px;color:#22c55e;}
+.dz-count{font-size:12px;color:var(--txt2);margin-top:3px;}
+.dz-clear{margin-left:auto;background:none;border:1px solid var(--bdr2);color:var(--txt2);padding:4px 8px;border-radius:6px;cursor:pointer;font-size:13px;}
+.dz-clear:hover{color:#ef4444;border-color:#ef4444;}
+.preview-wrap{border:1px solid var(--bdr);border-radius:10px;overflow:hidden;}
+.preview-title{font-size:12px;font-weight:700;color:var(--txt2);padding:8px 12px;background:var(--bg3);border-bottom:1px solid var(--bdr);text-transform:uppercase;letter-spacing:.5px;}
+.preview-scroll{overflow-x:auto;max-height:180px;overflow-y:auto;}
+.preview-tbl{width:100%;border-collapse:collapse;}
+.preview-tbl th{text-align:left;padding:6px 10px;color:var(--txt3);font-size:10px;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--bdr);background:var(--bg2);position:sticky;top:0;}
+.preview-tbl td{padding:6px 10px;border-bottom:1px solid var(--bdr);}
+.preview-tbl tbody tr:last-child td{border-bottom:none;}
+.preview-tbl tbody tr:hover td{background:var(--bg3);}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--bg2);border:1px solid var(--bdr2);padding:11px 22px;border-radius:10px;font-size:13px;font-weight:600;z-index:999;animation:fadeUp .2s ease;box-shadow:0 8px 40px rgba(0,0,0,.6);}
+.t-success{border-color:#22c55e;color:#4ade80;}
+.t-error{border-color:#ef4444;color:#f87171;}
+::-webkit-scrollbar{width:5px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:var(--bdr2);border-radius:3px;}
+`;
+
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+  </script>
+</body>
+</html>
